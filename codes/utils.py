@@ -20,7 +20,11 @@ def randomize_smiles(smiles):
         return smiles
     np.random.shuffle(ans)
     new_mol = Chem.RenumberAtoms(mol, ans)
-    return Chem.MolToSmiles(new_mol, canonical=False)
+    try:
+        return Chem.MolToSmiles(new_mol, canonical=False)
+    except RuntimeError:
+        print("Error in randomize_smiles for: ", smiles)
+        return smiles
 
 def likelihood(model, seqs):
     nll_loss = nn.NLLLoss(reduction="none")

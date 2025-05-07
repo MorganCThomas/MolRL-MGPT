@@ -1,8 +1,9 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 import pandas as pd
 import numpy as np
 import argparse
+import gzip
+from pathlib import Path
 from tqdm import tqdm
 
 import torch
@@ -11,7 +12,6 @@ from torch.utils.tensorboard import SummaryWriter
 from vocabulary import SMILESTokenizer, read_vocabulary, create_vocabulary
 from dataset import Dataset
 from model import GPT, GPTConfig
-from model_rnn import RNN
 from utils import model_validity, set_seed
 
 
@@ -67,7 +67,16 @@ if __name__ == '__main__':
         for line in list(file.readlines()):
             data.append(line.rstrip())
     else:
-        Exception("Undefined dataset!")
+        try:
+            dataset = Path(args.dataset)
+            if dataset.suffix == ".gz":
+                with gzip.open(args.dataset, 'rt') as f:
+                    data = f.read().splitlines()
+            elif dataset.suffix == ".smi":
+                with open(args.dataset, 'r') as f:
+                    data = f.read().splitlines()
+        except:
+            Exception("Undefined dataset! Wasn't just a .smi or .smi.gz file?")
     print(len(data))
 
     # Vocabulary

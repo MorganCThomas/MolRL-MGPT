@@ -1,21 +1,28 @@
 import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+import sys
 import argparse
 from tqdm import tqdm
 import numpy as np
 import pandas as pd
+from pathlib import Path
+import time
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
-import multiprocessing
 
 # rdkit
-from rdkit import Chem, DataStructs
+from rdkit import DataStructs, Chem
 
+sys.path.insert(0, str(Path(__file__).parent))
 from model import GPT, GPTConfig
 from vocabulary import read_vocabulary
 from utils import set_seed, sample_SMILES, likelihood, to_tensor, calc_fingerprints
-from scoring_function import get_scores, int_div
+from scoring_function import int_div
+
+from molscore import MolScore, MolScoreBenchmark, MolScoreCurriculum
+from ...common.utils import load_config, save_config
+
+wd = Path(__file__).parent.parent
 
 class MARL_trainer():
 
@@ -23,7 +30,7 @@ class MARL_trainer():
         self.writer = logger
         self.model_type = configs.model_type
         self.device = configs.device
-        self.oracle = configs.oracle.strip()
+        #self.oracle = configs.oracle.strip()
         self.num_agents = configs.num_agents
         self.prior_path = configs.prior_path
         self.voc = read_vocabulary(configs.vocab_path)
@@ -49,8 +56,10 @@ class MARL_trainer():
 
         mean_coef = 0
         for i in range(len(smiles)):
-            if scores[i] < 0:
+            if not Chem.MolFromSmiles(smiles[i]):
                 continue
+            #if scores[i] < 1e-6:
+            #    continue
             # canonicalized SMILES and fingerprints
             fp, smiles_i = calc_fingerprints([smiles[i]])
             new_data = pd.DataFrame({"smiles": smiles_i[0], "scores": scores[i], "seqs": [seqs_list[i]], "fps": fp[0]})
@@ -81,9 +90,9 @@ class MARL_trainer():
         return smiles, np.array(scores), seqs
 
 
-    def train(self):
-        if not os.path.exists(f'outputs/{self.oracle}'):
-            os.makedirs(f'outputs/{self.oracle}')
+    def train(self, scoring_function):
+        #if not os.path.exists(f'outputs/{self.oracle}'):
+        #    os.makedirs(f'outputs/{self.oracle}')
 
         if self.model_type == "gpt":
             prior_config = GPTConfig(self.voc.__len__(), n_layer=8, n_head=8, n_embd=256, block_size=128)
@@ -104,16 +113,21 @@ class MARL_trainer():
             agents[i].load_state_dict(torch.load(self.prior_path), strict=True)
             agents[i].eval()
 
-        for step in tqdm(range(self.n_steps)):
+        #for step in tqdm(range(self.n_steps)):
+        # Run until budget instead
+        step = 0
+        n_steps = scoring_function.budget // (self.batch_size * self.num_agents)  # Approximate
+        pbar = tqdm(total=scoring_function.budget, desc="Training", unit="Molecules")
+        while not scoring_function.finished:
             for i in range(self.num_agents):
                 samples, seqs, _ = sample_SMILES(agents[i], self.voc, n_mols=self.batch_size)
 
-                scores = get_scores(samples, mode=self.oracle)
+                scores = scoring_function(samples)
                 samples, scores, seqs = self._memory_update(samples, scores, seqs)
             
                 prior_likelihood = likelihood(prior, seqs)
                 agent_likelihood = likelihood(agents[i], seqs)
-                loss = torch.pow(self.sigma1 * (1 - step / self.n_steps) * to_tensor(np.array(scores)) - (prior_likelihood - agent_likelihood), 2)
+                loss = torch.pow(self.sigma1 * (1 - step / n_steps) * to_tensor(np.array(scores)) - (prior_likelihood - agent_likelihood), 2)
                 for j in range(i):
                     agent_j_likelihood = likelihood(agents[j], seqs)
                     loss -= self.sigma2 * torch.abs(agent_j_likelihood - agent_likelihood) * to_tensor(np.array(scores))
@@ -122,6 +136,9 @@ class MARL_trainer():
                 optimizers[i].zero_grad()
                 loss.backward()
                 optimizers[i].step()
+                
+            step += 1
+            pbar.update(self.batch_size * self.num_agents)
 
             self.writer.add_scalar('mean score in memory', np.mean(np.array(self.memory["scores"])), step)
             self.writer.add_scalar('top-1', self.memory["scores"][0], step)
@@ -134,10 +151,10 @@ class MARL_trainer():
                 self.writer.add_scalar('top-100-div', int_div(list(self.memory["smiles"][:100])), step)
                 self.writer.add_scalar('memory-div', int_div(list(self.memory["smiles"])), step)
 
-            if (step + 1) % 50 == 0:
-                self.memory.to_csv(f'outputs/{self.oracle}/{self.num_agents}agents+{step+1}steps.csv')
+            #if (step + 1) % 50 == 0:
+            #    self.memory.to_csv(f'outputs/{self.oracle}/{self.num_agents}agents+{step+1}steps.csv')
 
-        self.memory.to_csv(f'outputs/{self.oracle}/{self.num_agents}agents+{self.n_steps}steps.csv')
+        #self.memory.to_csv(f'outputs/{self.oracle}/{self.num_agents}agents+{self.n_steps}steps.csv')
         print(f'top-1 score: {self.memory["scores"][0]}')
         print(f'top-10 score: {np.mean(np.array(self.memory["scores"][:10]))}')
         print(f'top-100 score: {np.mean(np.array(self.memory["scores"][:100]))}, diversity: {int_div(list(self.memory["smiles"][:100]))}')
@@ -147,9 +164,10 @@ class MARL_trainer():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--run_name', type=str, default="")
+    parser.add_argument('--molscore_config', help='Path to the config file for the MolScore scoring function')
     parser.add_argument('--model_type', type=str, default="gpt")
     parser.add_argument('--device', type=str, default="cuda:0")
-    parser.add_argument('--oracle', type=str, default="JNK3")
+    #parser.add_argument('--oracle', type=str, default="JNK3")
     parser.add_argument('--num_agents', type=int, default=4)
     parser.add_argument('--n_steps', type=int, default=1000)
     parser.add_argument('--batch_size', type=int, default=128)
@@ -160,21 +178,73 @@ if __name__ == "__main__":
     parser.add_argument('--replay', type=int, default=5)
     parser.add_argument('--sim_penalize', type=bool, default=False)
     parser.add_argument('--sim_thres', type=float, default=0.7)
-    parser.add_argument('--prior_path', type=str, default="ckpt/your_pretrained_model.pt")
-    parser.add_argument('--vocab_path', type=str, default="data/vocab.txt")
-    parser.add_argument('--output_dir', type=str, default="log/")
+    parser.add_argument('--prior_path', type=str, default=str(Path(wd) / "ckpt/your_pretrained_model.pt"))
+    parser.add_argument('--vocab_path', type=str, default=str(Path(wd) / "data/vocab.txt"))
+    parser.add_argument('--output_dir', type=str, default=str(Path(wd) / "log/"))
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--n_jobs", type=int, default=-1, help="Ignored")
     args = parser.parse_args()
     print(args)
 
-    set_seed(42)
+    set_seed(args.seed)
 
-    writer = SummaryWriter(args.output_dir + f"{args.oracle}/{args.num_agents}_{args.model_type}_{args.run_name}/")
+    writer = SummaryWriter(str(Path(args.output_dir) / f"{time.strftime('%Y-%m-%d_%H-%M-%S', time.localtime())}/{args.num_agents}_{args.model_type}_{args.run_name}/"))
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
     writer.add_text("configs", str(args))
-
+    
     RL_trainer = MARL_trainer(logger=writer, configs=args)
-    RL_trainer.train()
+    
+    # ---- Run using MolScore ----
+    cfg = load_config(args.molscore_config)
+    # Single mode
+    if cfg.molscore_mode == "single":
+        task = MolScore(
+            model_name=cfg.model_name,
+            task_config=cfg.molscore_task,
+            budget=cfg.total_smiles,
+            output_dir=cfg.output_dir,
+            add_run_dir=True,
+            **cfg.get("molscore_kwargs", {}),
+        )
+        # Save configs
+        save_config(vars(args), Path(task.save_dir) / "args.yaml")
+        save_config(cfg, Path(task.save_dir) / "molscore_args.yaml")
+        with task as scorer:
+            RL_trainer.train(scoring_function = scorer)
+            
+    # Benchmark mode
+    if cfg.molscore_mode == "benchmark":
+        MSB = MolScoreBenchmark(
+            model_name=cfg.model_name,
+            benchmark=cfg.molscore_task,
+            budget=cfg.total_smiles,
+            output_dir=cfg.output_dir,
+            add_benchmark_dir=True,
+            **cfg.get("molscore_kwargs", {}),
+        )
+        # Save configs
+        save_config(vars(args), Path(MSB.output_dir) / "args.yaml")
+        save_config(cfg, Path(MSB.output_dir) / "molscore_args.yaml")
+        with MSB as benchmark:
+            for task in benchmark:
+                with task as scorer:
+                    RL_trainer.train(scoring_function = scorer)
+                    
+    # Curriculum mode
+    if cfg.molscore_mode == "curriculum":
+        task = MolScoreCurriculum(
+            model_name=cfg.model_name,
+            benchmark=cfg.molscore_task,
+            budget=cfg.total_smiles,
+            output_dir=cfg.output_dir,
+            **cfg.get("molscore_kwargs", {}),
+        )
+        # Save configs
+        save_config(vars(args), Path(task.save_dir) / "args.yaml")
+        save_config(cfg, Path(task.save_dir) / "molscore_args.yaml")
+        with task as scorer:
+            RL_trainer.train(scoring_function = scorer)
 
     writer.close()
     
