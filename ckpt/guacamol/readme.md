@@ -1,0 +1,1 @@
+Thes files were trained on the GuacaMol training dataset, the same way as stated by the authors with the exception of a lower batch size of 512. 
